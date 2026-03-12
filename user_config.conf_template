@@ -3,6 +3,12 @@
 # Configurazione utente lzer0 e accesso SSH
 # ============================================================
 
+
+# --- NOME DISPOSITIVO ---
+# Hostname della macchina (default: LZER0-PRO)
+DEVICE_HOSTNAME="LZER0-PRO"
+
+
 # --- PASSWORD ---
 # Genera l'hash con:
 #   openssl passwd -6 "tuapassword"
