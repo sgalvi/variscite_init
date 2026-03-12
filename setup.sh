@@ -2,11 +2,13 @@
 # ============================================================
 # setup_users.sh
 # - Legge configurazione da user_config.conf
-# - Rinomina utente debian → lzer0
+# - Rinomina utente debian → lzer0 (se non già fatto)
 # - Imposta password hashata e chiave SSH
 # - Aggiunge lzer0 a tutti i gruppi privilegiati
+# - Imposta hostname
 # - Rimuove utente weston e relativa home
 # - Configura SSH: no root login, solo lzer0 con password
+# Idempotente: può essere rieseguito senza danni
 # ============================================================
 
 set -e
@@ -14,9 +16,11 @@ set -e
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
 NC='\033[0m'
 
 log()  { echo -e "${GREEN}[INFO]${NC}  $1"; }
+skip() { echo -e "${CYAN}[SKIP]${NC}  $1"; }
 warn() { echo -e "${YELLOW}[WARN]${NC}  $1"; }
 err()  { echo -e "${RED}[ERR]${NC}   $1"; }
 
@@ -39,6 +43,8 @@ fi
 
 source "$CONFIG_FILE"
 
+DEVICE_HOSTNAME="${DEVICE_HOSTNAME:-LZER0-PRO}"
+
 if [ -z "$LZER0_PASSWORD_HASH" ]; then
     err "LZER0_PASSWORD_HASH non impostato in user_config.conf"
     err "Generalo con: openssl passwd -6 'tuapassword'"
@@ -53,37 +59,29 @@ OLD_USER="debian"
 NEW_USER="lzer0"
 
 # ============================================================
-# VERIFICA PRECONDIZIONI
+# STEP 1: RINOMINA UTENTE debian → lzer0
 # ============================================================
-
-if ! id "$OLD_USER" &>/dev/null; then
-    err "Utente '${OLD_USER}' non trovato. Uscita."
-    exit 1
-fi
 
 if id "$NEW_USER" &>/dev/null; then
-    err "Utente '${NEW_USER}' esiste già. Uscita."
+    skip "Utente '${NEW_USER}' esiste già, rinomina saltata."
+elif id "$OLD_USER" &>/dev/null; then
+    if who | grep -q "^${OLD_USER} "; then
+        err "Utente '${OLD_USER}' risulta loggato. Eseguire solo da root senza sessioni attive."
+        exit 1
+    fi
+    log "Rinomina utente '${OLD_USER}' → '${NEW_USER}'..."
+    usermod -l "$NEW_USER" "$OLD_USER"
+    groupmod -n "$NEW_USER" "$OLD_USER"
+    usermod -d "/home/${NEW_USER}" -m "$NEW_USER"
+    usermod -c "$NEW_USER" "$NEW_USER"
+    log "Utente rinominato."
+else
+    err "Né '${OLD_USER}' né '${NEW_USER}' trovati. Impossibile procedere."
     exit 1
 fi
 
-if who | grep -q "^${OLD_USER} "; then
-    err "Utente '${OLD_USER}' risulta loggato. Eseguire solo da root senza sessioni attive."
-    exit 1
-fi
-
 # ============================================================
-# RINOMINA UTENTE debian → lzer0
-# ============================================================
-
-log "Rinomina utente '${OLD_USER}' → '${NEW_USER}'..."
-usermod -l "$NEW_USER" "$OLD_USER"
-groupmod -n "$NEW_USER" "$OLD_USER"
-usermod -d "/home/${NEW_USER}" -m "$NEW_USER"
-usermod -c "$NEW_USER" "$NEW_USER"
-log "Utente rinominato correttamente."
-
-# ============================================================
-# IMPOSTA PASSWORD
+# STEP 2: IMPOSTA PASSWORD
 # ============================================================
 
 log "Impostazione password hashata..."
@@ -91,23 +89,28 @@ usermod -p "$LZER0_PASSWORD_HASH" "$NEW_USER"
 log "Password impostata."
 
 # ============================================================
-# CHIAVE SSH
+# STEP 3: CHIAVE SSH
 # ============================================================
 
+SSH_DIR="/home/${NEW_USER}/.ssh"
+AUTH_KEYS="${SSH_DIR}/authorized_keys"
+
 if [ -n "$LZER0_SSH_PUBKEY" ]; then
-    log "Configurazione chiave SSH pubblica..."
-    SSH_DIR="/home/${NEW_USER}/.ssh"
-    AUTH_KEYS="${SSH_DIR}/authorized_keys"
-    mkdir -p "$SSH_DIR"
-    echo "$LZER0_SSH_PUBKEY" > "$AUTH_KEYS"
-    chmod 700 "$SSH_DIR"
-    chmod 600 "$AUTH_KEYS"
-    chown -R "${NEW_USER}:${NEW_USER}" "$SSH_DIR"
-    log "Chiave SSH configurata."
+    if [ -f "$AUTH_KEYS" ] && grep -qF "$LZER0_SSH_PUBKEY" "$AUTH_KEYS"; then
+        skip "Chiave SSH già presente in authorized_keys."
+    else
+        log "Configurazione chiave SSH pubblica..."
+        mkdir -p "$SSH_DIR"
+        echo "$LZER0_SSH_PUBKEY" >> "$AUTH_KEYS"
+        chmod 700 "$SSH_DIR"
+        chmod 600 "$AUTH_KEYS"
+        chown -R "${NEW_USER}:${NEW_USER}" "$SSH_DIR"
+        log "Chiave SSH configurata."
+    fi
 fi
 
 # ============================================================
-# GRUPPI PRIVILEGIATI
+# STEP 4: GRUPPI PRIVILEGIATI
 # ============================================================
 
 log "Aggiunta '${NEW_USER}' ai gruppi privilegiati..."
@@ -121,28 +124,55 @@ ADDED=()
 SKIPPED=()
 
 for grp in "${PRIV_GROUPS[@]}"; do
-    if getent group "$grp" &>/dev/null; then
+    if ! getent group "$grp" &>/dev/null; then
+        SKIPPED+=("$grp")
+    elif id -nG "$NEW_USER" | grep -qw "$grp"; then
+        SKIPPED+=("$grp(già membro)")
+    else
         usermod -aG "$grp" "$NEW_USER"
         ADDED+=("$grp")
-    else
-        SKIPPED+=("$grp")
     fi
 done
 
-log "Gruppi aggiunti:  ${ADDED[*]}"
-warn "Gruppi non presenti (ignorati): ${SKIPPED[*]}"
+[ ${#ADDED[@]}   -gt 0 ] && log  "Gruppi aggiunti:  ${ADDED[*]}"
+[ ${#SKIPPED[@]} -gt 0 ] && skip "Gruppi saltati:   ${SKIPPED[*]}"
 
 # ============================================================
-# SUDOERS
+# STEP 5: SUDOERS
 # ============================================================
 
-log "Configurazione sudoers per '${NEW_USER}'..."
-echo "${NEW_USER} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/${NEW_USER}
-chmod 440 /etc/sudoers.d/${NEW_USER}
+if [ -f "/etc/sudoers.d/${NEW_USER}" ]; then
+    skip "Sudoers per '${NEW_USER}' già configurato."
+else
+    log "Configurazione sudoers per '${NEW_USER}'..."
+    echo "${NEW_USER} ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/${NEW_USER}
+    chmod 440 /etc/sudoers.d/${NEW_USER}
+    log "Sudoers configurato."
+fi
 rm -f /etc/sudoers.d/${OLD_USER}
 
 # ============================================================
-# RIMOZIONE UTENTE weston
+# STEP 6: HOSTNAME
+# ============================================================
+
+CURRENT_HOSTNAME=$(hostname)
+if [ "$CURRENT_HOSTNAME" = "$DEVICE_HOSTNAME" ] && [ "$(cat /etc/hostname)" = "$DEVICE_HOSTNAME" ]; then
+    skip "Hostname già impostato: ${DEVICE_HOSTNAME}"
+else
+    log "Impostazione hostname '${DEVICE_HOSTNAME}'..."
+    echo "$DEVICE_HOSTNAME" > /etc/hostname
+    # Aggiorna o aggiunge riga 127.0.1.1
+    if grep -q "127\.0\.1\.1" /etc/hosts; then
+        sed -i "s/127\.0\.1\.1.*/127.0.1.1\t${DEVICE_HOSTNAME}/" /etc/hosts
+    else
+        echo -e "127.0.1.1\t${DEVICE_HOSTNAME}" >> /etc/hosts
+    fi
+    hostname "$DEVICE_HOSTNAME"
+    log "Hostname impostato: $(hostname)"
+fi
+
+# ============================================================
+# STEP 7: RIMOZIONE UTENTE weston
 # ============================================================
 
 if id "weston" &>/dev/null; then
@@ -153,21 +183,15 @@ if id "weston" &>/dev/null; then
     getent group wayland &>/dev/null && groupdel wayland 2>/dev/null || true
     log "Utente 'weston' rimosso."
 else
-    warn "Utente 'weston' non trovato, nulla da rimuovere."
+    skip "Utente 'weston' non presente, nulla da rimuovere."
 fi
 
 # ============================================================
-# CONFIGURAZIONE SSH
+# STEP 8: CONFIGURAZIONE SSH
 # ============================================================
-
-log "Configurazione sshd..."
 
 SSHD_CONF="/etc/ssh/sshd_config"
 
-# Backup
-cp "$SSHD_CONF" "${SSHD_CONF}.bak_$(date +%Y%m%d_%H%M%S)"
-
-# Funzione per impostare o aggiungere una direttiva sshd
 set_sshd() {
     local key="$1"
     local val="$2"
@@ -178,21 +202,31 @@ set_sshd() {
     fi
 }
 
-set_sshd "PermitRootLogin"      "no"
-set_sshd "PasswordAuthentication" "yes"
-set_sshd "PubkeyAuthentication" "yes"
-set_sshd "PermitEmptyPasswords" "no"
-set_sshd "AllowUsers"           "$NEW_USER"
+SSHD_NEEDS_UPDATE=false
+grep -q "^PermitRootLogin no"           "$SSHD_CONF" || SSHD_NEEDS_UPDATE=true
+grep -q "^AllowUsers ${NEW_USER}"       "$SSHD_CONF" || SSHD_NEEDS_UPDATE=true
+grep -q "^PasswordAuthentication yes"   "$SSHD_CONF" || SSHD_NEEDS_UPDATE=true
 
-# Verifica sintassi sshd
-if sshd -t 2>/dev/null; then
-    log "Configurazione sshd valida."
-    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
-    log "Servizio SSH riavviato."
+if [ "$SSHD_NEEDS_UPDATE" = false ]; then
+    skip "Configurazione sshd già aggiornata."
 else
-    err "Errore nella configurazione sshd! Ripristino backup..."
-    cp "${SSHD_CONF}.bak_"* "$SSHD_CONF"
-    exit 1
+    log "Configurazione sshd..."
+    cp "$SSHD_CONF" "${SSHD_CONF}.bak_$(date +%Y%m%d_%H%M%S)"
+    set_sshd "PermitRootLogin"          "no"
+    set_sshd "PasswordAuthentication"   "yes"
+    set_sshd "PubkeyAuthentication"     "yes"
+    set_sshd "PermitEmptyPasswords"     "no"
+    set_sshd "AllowUsers"               "$NEW_USER"
+
+    if sshd -t 2>/dev/null; then
+        log "Configurazione sshd valida."
+        systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+        log "Servizio SSH riavviato."
+    else
+        err "Errore nella configurazione sshd! Ripristino backup..."
+        cp "$(ls -t ${SSHD_CONF}.bak_* | head -1)" "$SSHD_CONF"
+        exit 1
+    fi
 fi
 
 # ============================================================
@@ -200,77 +234,64 @@ fi
 # ============================================================
 
 echo ""
-log "Verifica configurazione finale:"
+log "======= VERIFICA FINALE ======="
+
+check() {
+    local label="$1"
+    local result="$2"  # "ok" o qualsiasi altro valore = ko
+    local detail="$3"
+    if [ "$result" = "ok" ]; then
+        echo -e "  ${GREEN}OK${NC}  ${label}${detail:+: $detail}"
+    else
+        echo -e "  ${RED}KO${NC}  ${label}${detail:+: $detail}"
+    fi
+}
 
 echo ""
-echo -e "  Utente ${NEW_USER}:"
-if id "$NEW_USER" &>/dev/null; then
-    echo -e "  ${GREEN}OK${NC}  utente esiste"
-    echo      "      UID:    $(id -u ${NEW_USER})"
-    echo      "      GID:    $(id -g ${NEW_USER})"
-    echo      "      Gruppi: $(groups ${NEW_USER} | cut -d: -f2)"
-    echo      "      Home:   $(getent passwd ${NEW_USER} | cut -d: -f6)"
-    echo      "      Shell:  $(getent passwd ${NEW_USER} | cut -d: -f7)"
-else
-    echo -e "  ${RED}KO${NC}  utente non trovato!"
-fi
+# Utente
+id "$NEW_USER" &>/dev/null \
+    && check "Utente '${NEW_USER}' esiste" ok "UID=$(id -u $NEW_USER) | Gruppi: $(groups $NEW_USER | cut -d: -f2)" \
+    || check "Utente '${NEW_USER}' esiste" ko
 
-echo ""
-echo -e "  Password:"
-if getent shadow "$NEW_USER" | cut -d: -f2 | grep -qv '^\*\|^!\|^$'; then
-    echo -e "  ${GREEN}OK${NC}  password impostata"
-else
-    echo -e "  ${RED}KO${NC}  password non impostata"
-fi
+# Home
+[ -d "/home/${NEW_USER}" ] \
+    && check "Home /home/${NEW_USER}" ok "owner=$(stat -c '%U' /home/${NEW_USER})" \
+    || check "Home /home/${NEW_USER}" ko
 
-echo ""
-echo -e "  Chiave SSH:"
-if [ -f "/home/${NEW_USER}/.ssh/authorized_keys" ]; then
-    echo -e "  ${GREEN}OK${NC}  authorized_keys presente"
-else
-    echo -e "  ${YELLOW}--${NC}  nessuna chiave SSH configurata"
-fi
+# Password
+getent shadow "$NEW_USER" | cut -d: -f2 | grep -qv '^\*\|^!\|^$' \
+    && check "Password impostata" ok \
+    || check "Password impostata" ko
 
-echo ""
-echo -e "  Home /home/${NEW_USER}:"
-if [ -d "/home/${NEW_USER}" ]; then
-    OWNER=$(stat -c '%U' /home/${NEW_USER})
-    echo -e "  ${GREEN}OK${NC}  directory esiste (owner: ${OWNER})"
-else
-    echo -e "  ${RED}KO${NC}  directory non trovata!"
-fi
+# Chiave SSH
+[ -f "$AUTH_KEYS" ] \
+    && check "Chiave SSH authorized_keys" ok \
+    || check "Chiave SSH authorized_keys" -- "nessuna chiave configurata"
 
-echo ""
-echo -e "  Sudo NOPASSWD:"
-if sudo -u "$NEW_USER" sudo -n true 2>/dev/null; then
-    echo -e "  ${GREEN}OK${NC}  funzionante"
-else
-    echo -e "  ${RED}KO${NC}  non funziona"
-fi
+# Sudo
+sudo -u "$NEW_USER" sudo -n true 2>/dev/null \
+    && check "Sudo NOPASSWD" ok \
+    || check "Sudo NOPASSWD" ko
 
-echo ""
-echo -e "  SSH - PermitRootLogin:"
-if grep -q "^PermitRootLogin no" "$SSHD_CONF"; then
-    echo -e "  ${GREEN}OK${NC}  root login disabilitato"
-else
-    echo -e "  ${RED}KO${NC}  verificare manualmente sshd_config"
-fi
+# Hostname
+[ "$(hostname)" = "$DEVICE_HOSTNAME" ] \
+    && check "Hostname" ok "$(hostname)" \
+    || check "Hostname" ko "atteso=${DEVICE_HOSTNAME} trovato=$(hostname)"
 
-echo ""
-echo -e "  SSH - AllowUsers:"
-if grep -q "^AllowUsers ${NEW_USER}" "$SSHD_CONF"; then
-    echo -e "  ${GREEN}OK${NC}  solo '${NEW_USER}' autorizzato"
-else
-    echo -e "  ${RED}KO${NC}  verificare manualmente sshd_config"
-fi
+# SSH PermitRootLogin
+grep -q "^PermitRootLogin no" "$SSHD_CONF" \
+    && check "SSH PermitRootLogin no" ok \
+    || check "SSH PermitRootLogin no" ko
 
-echo ""
-echo -e "  Utente weston:"
-if id "weston" &>/dev/null; then
-    echo -e "  ${RED}KO${NC}  utente ancora presente!"
-else
-    echo -e "  ${GREEN}OK${NC}  rimosso correttamente"
-fi
+# SSH AllowUsers
+grep -q "^AllowUsers ${NEW_USER}" "$SSHD_CONF" \
+    && check "SSH AllowUsers ${NEW_USER}" ok \
+    || check "SSH AllowUsers ${NEW_USER}" ko
+
+# Weston rimosso
+! id "weston" &>/dev/null \
+    && check "Utente 'weston' rimosso" ok \
+    || check "Utente 'weston' rimosso" ko
 
 echo ""
 log "Setup completato."
