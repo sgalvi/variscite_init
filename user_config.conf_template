@@ -1,0 +1,18 @@
+# ============================================================
+# user_config.conf
+# Configurazione utente lzer0 e accesso SSH
+# ============================================================
+
+# --- PASSWORD ---
+# Genera l'hash con:
+#   openssl passwd -6 "tuapassword"
+# oppure:
+#   python3 -c "import crypt; print(crypt.crypt('tuapassword', crypt.mksalt(crypt.METHOD_SHA512)))"
+#
+# Incolla l'hash risultante qui sotto (tutto su una riga):
+LZER0_PASSWORD_HASH=""
+
+# --- CHIAVE SSH PUBBLICA ---
+# Incolla qui la tua chiave pubblica (contenuto di ~/.ssh/id_rsa.pub o id_ed25519.pub)
+# Esempio: ssh-ed25519 AAAAC3Nza... utente@host
+LZER0_SSH_PUBKEY=""
